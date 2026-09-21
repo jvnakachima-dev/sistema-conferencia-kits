@@ -1,0 +1,325 @@
+<script>
+  (function () {
+    const connectionResult = document.getElementById('connection-result');
+    const kitSelect = document.getElementById('kit-select');
+    const kitStatus = document.getElementById('kit-status');
+    const composition = document.getElementById('composition');
+    const compositionBody = document.getElementById('composition-body');
+    const conference = document.getElementById('conference');
+    const startConferenceButton = document.getElementById('start-conference');
+    const resetConferenceButton = document.getElementById('reset-conference');
+    const barcodeInput = document.getElementById('barcode-input');
+    const registerScanButton = document.getElementById('register-scan');
+    const scanFeedback = document.getElementById('scan-feedback');
+    const saveResult = document.getElementById('save-result');
+    const conferenceBody = document.getElementById('conference-body');
+    const finishConferenceButton = document.getElementById('finish-conference');
+    const startCameraButton = document.getElementById('start-camera');
+    const stopCameraButton = document.getElementById('stop-camera');
+    const cameraPanel = document.getElementById('camera-panel');
+    const cameraVideo = document.getElementById('camera-video');
+    const cameraFallbackReader = document.getElementById('camera-fallback-reader');
+    const cameraStatus = document.getElementById('camera-status');
+    let selectedComposition = null;
+    let session = null;
+    const camera = { active: false, mode: null, stream: null, detector: null, fallbackScanner: null, animationFrame: null, detecting: false, lastCode: '', lastAcceptedAt: 0 };
+
+    function showConnectionError(message) { connectionResult.className = 'result error'; connectionResult.textContent = 'Erro: ' + message; }
+    function showKitError(message) { kitStatus.className = 'result error'; kitStatus.textContent = 'Erro: ' + message; composition.hidden = true; }
+
+    function loadKits() {
+      const button = document.getElementById('refresh-kits');
+      kitSelect.disabled = true;
+      kitSelect.innerHTML = '<option value="">Carregando kits…</option>';
+      kitStatus.className = 'result'; kitStatus.textContent = ''; composition.hidden = true; conference.hidden = true; button.disabled = true;
+      google.script.run.withSuccessHandler(function (kits) {
+        button.disabled = false; kitSelect.innerHTML = '<option value="">Selecione um kit</option>';
+        kits.forEach(function (kit) {
+          const option = document.createElement('option');
+          option.value = kit.id; option.textContent = kit.id + ' — ' + kit.nome; kitSelect.appendChild(option);
+        });
+        kitSelect.disabled = kits.length === 0;
+        if (!kits.length) kitStatus.textContent = 'Nenhum kit cadastrado na planilha.';
+      }).withFailureHandler(function (error) {
+        button.disabled = false; showKitError(error && error.message ? error.message : 'Não foi possível carregar os kits.');
+      }).getKits();
+    }
+
+    function loadComposition(kitId) {
+      if (!kitId) { composition.hidden = true; conference.hidden = true; return; }
+      kitStatus.className = 'result'; kitStatus.textContent = 'Carregando composição…'; composition.hidden = true;
+      conference.hidden = true;
+      google.script.run.withSuccessHandler(function (data) {
+        const pieces = data.pecas || [];
+        document.getElementById('selected-kit-name').textContent = data.kit.nome;
+        const total = pieces.reduce(function (sum, item) { return sum + Number(item.quantidade || 0); }, 0);
+        document.getElementById('composition-total').textContent = total + ' unidade(s) esperada(s)';
+        compositionBody.replaceChildren();
+        pieces.forEach(function (item) {
+          const row = document.createElement('tr'); const piece = item.peca || {};
+          [piece.nome || 'Peça não encontrada', piece.codFabrica || '—', piece.codBarras || '—', item.quantidade || '0'].forEach(function (value, index) {
+            const cell = document.createElement('td'); cell.textContent = value;
+            if (index === 3) cell.className = 'number'; row.appendChild(cell);
+          });
+          compositionBody.appendChild(row);
+        });
+        kitStatus.textContent = pieces.length ? '' : 'Este kit ainda não possui itens cadastrados.'; composition.hidden = false;
+        selectedComposition = data;
+        prepareConference();
+      }).withFailureHandler(function (error) {
+        showKitError(error && error.message ? error.message : 'Não foi possível carregar a composição.');
+      }).getKitComposition(kitId);
+    }
+
+    function prepareConference() {
+      stopCamera();
+      session = null;
+      scanFeedback.className = 'result'; scanFeedback.textContent = '';
+      saveResult.className = 'result'; saveResult.textContent = '';
+      barcodeInput.value = ''; barcodeInput.disabled = true;
+      registerScanButton.disabled = true; resetConferenceButton.disabled = true;
+      finishConferenceButton.disabled = true;
+      startCameraButton.disabled = true; stopCameraButton.disabled = true;
+      startConferenceButton.disabled = !selectedComposition || !selectedComposition.pecas.length;
+      conference.hidden = !selectedComposition || !selectedComposition.pecas.length;
+      ['metric-expected', 'metric-found', 'metric-missing', 'metric-problems'].forEach(function (id) { document.getElementById(id).textContent = '0'; });
+      conferenceBody.replaceChildren();
+    }
+
+    function startConference() {
+      if (!selectedComposition) return;
+      const items = selectedComposition.pecas.map(function (item) {
+        const piece = item.peca || {};
+        return { pecaId: String(item.pecaId), nome: piece.nome || 'Peça não encontrada', codBarras: String(piece.codBarras || ''), esperada: Number(item.quantidade), lida: 0 };
+      });
+      const byBarcode = {};
+      items.forEach(function (item) { byBarcode[item.codBarras] = item; });
+      session = { items: items, byBarcode: byBarcode, problems: 0, invalidBarcodes: [], saved: false };
+      startConferenceButton.disabled = true; resetConferenceButton.disabled = false;
+      barcodeInput.disabled = false; registerScanButton.disabled = false; finishConferenceButton.disabled = false; startCameraButton.disabled = false;
+      scanFeedback.className = 'result'; scanFeedback.textContent = 'Conferência iniciada. Faça a primeira leitura.';
+      saveResult.className = 'result'; saveResult.textContent = '';
+      renderConference(); barcodeInput.focus();
+    }
+
+    function resetConference() {
+      if (!session) return;
+      session.items.forEach(function (item) { item.lida = 0; }); session.problems = 0;
+      scanFeedback.className = 'result'; scanFeedback.textContent = 'Leituras limpas. Você pode começar novamente.';
+      renderConference(); barcodeInput.value = ''; barcodeInput.focus();
+    }
+
+    function registerScan(code) {
+      if (!session || session.saved || !code) return;
+      const readCode = String(code).replace(/\s/g, '');
+      const item = resolveBarcode(readCode);
+      if (!item) {
+        session.problems += 1;
+        session.invalidBarcodes.push(readCode);
+        scanFeedback.className = 'result scan-error';
+        scanFeedback.textContent = 'Código não pertence ao kit selecionado: ' + readCode;
+      } else {
+        item.lida += 1;
+        if (item.lida > item.esperada) {
+          session.problems += 1;
+          scanFeedback.className = 'result scan-error';
+          scanFeedback.textContent = 'Quantidade excedida: ' + item.nome + '.';
+        } else {
+          scanFeedback.className = 'result scan-success';
+          scanFeedback.textContent = 'Leitura registrada: ' + item.nome + ' (' + item.lida + ' de ' + item.esperada + ').';
+        }
+        const complete = session.items.every(function (entry) { return entry.lida === entry.esperada; });
+        if (complete && session.problems === 0) scanFeedback.textContent = 'Kit conferido com sucesso. Todas as quantidades foram lidas.';
+      }
+      renderConference(); barcodeInput.value = ''; barcodeInput.focus();
+    }
+
+    function resolveBarcode(code) {
+      if (session.byBarcode[code]) return session.byBarcode[code];
+      // Alguns leitores e etiquetas diferem somente pelo dígito verificador final.
+      if (code.length > 1 && session.byBarcode[code.slice(0, -1)]) return session.byBarcode[code.slice(0, -1)];
+      return null;
+    }
+
+    async function startCamera() {
+      if (!session || session.saved) return;
+      if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        showCameraError('A câmera precisa de um navegador atualizado e acesso seguro (HTTPS).');
+        return;
+      }
+      if (!('BarcodeDetector' in window)) {
+        startFallbackCamera();
+        return;
+      }
+      startNativeCamera();
+    }
+
+    async function startNativeCamera() {
+      startCameraButton.disabled = true;
+      cameraVideo.hidden = false; cameraFallbackReader.hidden = true;
+      cameraStatus.textContent = 'Solicitando acesso à câmera…';
+      cameraPanel.hidden = false;
+      try {
+        const requested = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'itf', 'codabar'];
+        const supported = typeof BarcodeDetector.getSupportedFormats === 'function' ? await BarcodeDetector.getSupportedFormats() : requested;
+        const formats = requested.filter(function(format) { return supported.indexOf(format) !== -1; });
+        camera.detector = new BarcodeDetector(formats.length ? { formats: formats } : undefined);
+        camera.stream = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        });
+        cameraVideo.srcObject = camera.stream;
+        await cameraVideo.play();
+        camera.active = true; camera.mode = 'native'; camera.lastCode = ''; camera.lastAcceptedAt = 0;
+        stopCameraButton.disabled = false;
+        cameraStatus.textContent = 'Posicione o código de barras dentro da área destacada.';
+        scanCameraFrame();
+      } catch (error) {
+        stopCamera();
+        showCameraError('Não foi possível abrir a câmera. Verifique a permissão do navegador.');
+      }
+    }
+
+    async function startFallbackCamera() {
+      if (!window.Html5Qrcode) {
+        showCameraError('O leitor compatível não foi carregado. Verifique sua conexão e atualize a página.');
+        return;
+      }
+      startCameraButton.disabled = true;
+      cameraVideo.hidden = true; cameraFallbackReader.hidden = false;
+      cameraStatus.textContent = 'Abrindo leitor compatível com este navegador…';
+      cameraPanel.hidden = false;
+      try {
+        camera.fallbackScanner = new Html5Qrcode('camera-fallback-reader', { verbose: false });
+        await camera.fallbackScanner.start(
+          { facingMode: 'environment' },
+          { fps: 10, qrbox: { width: 300, height: 140 }, aspectRatio: 1.7778 },
+          function(decodedText) { acceptCameraBarcode(decodedText); },
+          function() { /* Tentativas sem leitura são esperadas durante o enquadramento. */ }
+        );
+        camera.active = true; camera.mode = 'fallback'; camera.lastCode = ''; camera.lastAcceptedAt = 0;
+        stopCameraButton.disabled = false;
+        cameraStatus.textContent = 'Leitor compatível ativo. Posicione o código dentro da área destacada.';
+      } catch (error) {
+        stopCamera();
+        showCameraError('Não foi possível abrir a câmera. Verifique a permissão do Safari e tente novamente.');
+      }
+    }
+
+    function scanCameraFrame() {
+      if (!camera.active) return;
+      if (camera.detecting || cameraVideo.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+        camera.animationFrame = requestAnimationFrame(scanCameraFrame); return;
+      }
+      camera.detecting = true;
+      camera.detector.detect(cameraVideo).then(function(codes) {
+        const barcode = codes.length ? String(codes[0].rawValue || '').replace(/\s/g, '') : '';
+        const now = Date.now();
+        if (barcode) acceptCameraBarcode(barcode);
+      }).catch(function() {
+        cameraStatus.textContent = 'Aponte a câmera para um código de barras bem iluminado.';
+      }).finally(function() {
+        camera.detecting = false;
+        if (camera.active) camera.animationFrame = requestAnimationFrame(scanCameraFrame);
+      });
+    }
+
+    function acceptCameraBarcode(barcode) {
+      const code = String(barcode || '').replace(/\s/g, '');
+      const now = Date.now();
+      if (!code || (code === camera.lastCode && now - camera.lastAcceptedAt <= 1500)) return;
+      camera.lastCode = code; camera.lastAcceptedAt = now;
+      registerScan(code);
+      cameraStatus.textContent = 'Leitura registrada: ' + code;
+    }
+
+    function stopCamera() {
+      if (camera.animationFrame) cancelAnimationFrame(camera.animationFrame);
+      if (camera.stream) camera.stream.getTracks().forEach(function(track) { track.stop(); });
+      if (camera.fallbackScanner) {
+        const scanner = camera.fallbackScanner;
+        camera.fallbackScanner = null;
+        scanner.stop().catch(function() {}).then(function() { return scanner.clear(); }).catch(function() {});
+      }
+      camera.active = false; camera.stream = null; camera.detector = null; camera.animationFrame = null; camera.detecting = false;
+      camera.mode = null;
+      cameraVideo.srcObject = null; cameraPanel.hidden = true;
+      stopCameraButton.disabled = true;
+      if (session && !session.saved) startCameraButton.disabled = false;
+    }
+
+    function showCameraError(message) {
+      cameraPanel.hidden = false; cameraStatus.textContent = message;
+      scanFeedback.className = 'result scan-error'; scanFeedback.textContent = message;
+      startCameraButton.disabled = false;
+    }
+
+    function finishConference() {
+      if (!session || session.saved) return;
+      if (!window.confirm('Deseja gravar esta conferência na planilha? Esta ação não poderá ser desfeita pela página.')) return;
+      finishConferenceButton.disabled = true;
+      saveResult.className = 'result'; saveResult.textContent = 'Salvando conferência…';
+      const readings = session.items.map(function(item) { return { pecaId: item.pecaId, encontrada: item.lida }; });
+      google.script.run.withSuccessHandler(function(result) {
+        session.saved = true;
+        stopCamera();
+        barcodeInput.disabled = true; registerScanButton.disabled = true; resetConferenceButton.disabled = true;
+        const details = 'Esperadas: ' + result.esperadas + ' · Lidas: ' + result.encontradas + ' · Faltando: ' + result.faltando + ' · Excedentes: ' + result.excedentes;
+        saveResult.className = 'result save-success';
+        saveResult.textContent = 'Conferência #' + result.conferenciaId + ' gravada. Resultado: ' + result.resultado + '. ' + details + (result.leiturasInvalidas ? ' · Leituras inválidas: ' + result.leiturasInvalidas : '');
+      }).withFailureHandler(function(error) {
+        finishConferenceButton.disabled = false;
+        saveResult.className = 'result scan-error';
+        saveResult.textContent = 'Não foi possível gravar: ' + (error && error.message ? error.message : 'erro desconhecido.');
+      }).saveConference(selectedComposition.kit.id, readings, session.invalidBarcodes);
+    }
+
+    function renderConference() {
+      const totals = session.items.reduce(function (result, item) {
+        result.esperada += item.esperada; result.lida += item.lida; result.faltando += Math.max(item.esperada - item.lida, 0); return result;
+      }, { esperada: 0, lida: 0, faltando: 0 });
+      document.getElementById('metric-expected').textContent = totals.esperada;
+      document.getElementById('metric-found').textContent = totals.lida;
+      document.getElementById('metric-missing').textContent = totals.faltando;
+      document.getElementById('metric-problems').textContent = session.problems;
+      conferenceBody.replaceChildren();
+      session.items.forEach(function (item) {
+        let status = 'Pendente'; let statusClass = 'pending';
+        if (item.lida > item.esperada) { status = 'Excedente'; statusClass = 'excess'; }
+        else if (item.lida === item.esperada) { status = 'Completo'; statusClass = 'complete'; }
+        else if (item.lida > 0) { status = 'Parcial'; statusClass = 'partial'; }
+        const row = document.createElement('tr');
+        [item.nome, item.codBarras, item.esperada, item.lida].forEach(function (value, index) {
+          const cell = document.createElement('td'); cell.textContent = value;
+          if (index > 1) cell.className = 'number'; row.appendChild(cell);
+        });
+        const statusCell = document.createElement('td'); const badge = document.createElement('span');
+        badge.className = 'status ' + statusClass; badge.textContent = status; statusCell.appendChild(badge); row.appendChild(statusCell);
+        conferenceBody.appendChild(row);
+      });
+    }
+
+    document.getElementById('test-connection').addEventListener('click', function () {
+      const button = this;
+      connectionResult.className = 'result'; connectionResult.textContent = 'Testando…';
+      button.disabled = true;
+      google.script.run.withSuccessHandler(function (data) {
+        button.disabled = false; connectionResult.className = 'result success';
+        connectionResult.textContent = data.message + ' Planilha: ' + data.spreadsheetName + '.';
+      }).withFailureHandler(function (error) {
+        button.disabled = false; showConnectionError(error && error.message ? error.message : 'Não foi possível concluir a solicitação.');
+      }).testConnection();
+    });
+    document.getElementById('refresh-kits').addEventListener('click', loadKits);
+    kitSelect.addEventListener('change', function () { loadComposition(this.value); });
+    startConferenceButton.addEventListener('click', startConference);
+    resetConferenceButton.addEventListener('click', resetConference);
+    finishConferenceButton.addEventListener('click', finishConference);
+    startCameraButton.addEventListener('click', startCamera);
+    stopCameraButton.addEventListener('click', stopCamera);
+    document.getElementById('scan-form').addEventListener('submit', function (event) {
+      event.preventDefault(); registerScan(barcodeInput.value.trim());
+    });
+    loadKits();
+  }());
+</script>
