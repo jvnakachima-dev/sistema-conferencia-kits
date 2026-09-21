@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#173b7a">
+    <title>Leitor de Códigos — Sistema de Kits</title>
+    <style>
+      :root { color: #172033; font-family: Arial, sans-serif; background: #f4f7fb; }
+      * { box-sizing: border-box; }
+      body { margin: 0; }
+      main { margin: 0 auto; max-width: 640px; padding: 24px 16px; }
+      h1 { font-size: 1.55rem; margin: 0 0 8px; }
+      p { color: #526174; line-height: 1.45; }
+      .card { background: #fff; border: 1px solid #dbe3ef; border-radius: 12px; box-shadow: 0 2px 8px #1720330c; padding: 18px; }
+      button { background: #2863c8; border: 0; border-radius: 7px; color: #fff; cursor: pointer; font: inherit; font-weight: 700; padding: 12px 16px; }
+      button:disabled { cursor: wait; opacity: .65; }
+      #reader { border-radius: 8px; margin-top: 16px; overflow: hidden; }
+      #reader video { max-height: 58vh; object-fit: cover; width: 100%; }
+      #status { display: block; margin-top: 14px; min-height: 1.5em; }
+      .success { background: #dcfae6; border-radius: 8px; color: #14733e; font-weight: 700; padding: 12px; }
+      .error { color: #b42318; font-weight: 700; }
+      .manual { background: #f6f8fb; border-radius: 8px; margin-top: 16px; padding: 14px; }
+      code { word-break: break-all; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Leitor de códigos</h1>
+      <p>Aponte a câmera traseira para o código de barras. A leitura será enviada para a conferência aberta.</p>
+      <section class="card">
+        <button id="start" type="button">Abrir câmera</button>
+        <div id="reader"></div>
+        <output id="status" aria-live="polite"></output>
+        <div id="manual" class="manual" hidden>
+          <strong>Código lido:</strong> <code id="decoded-code"></code>
+          <p>Volte para a página do sistema para continuar a conferência.</p>
+        </div>
+      </section>
+    </main>
+    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script>
+      (function () {
+        const startButton = document.getElementById('start');
+        const status = document.getElementById('status');
+        const manual = document.getElementById('manual');
+        const decodedCode = document.getElementById('decoded-code');
+        const returnOrigin = new URLSearchParams(window.location.search).get('returnOrigin');
+        let scanner = null;
+        let lastCode = '';
+        let lastReadAt = 0;
+
+        function setStatus(message, type) {
+          status.className = type || '';
+          status.textContent = message;
+        }
+
+        async function startScanning() {
+          if (!returnOrigin) {
+            setStatus('Esta página deve ser aberta a partir do Sistema de Conferência de Kits.', 'error');
+            return;
+          }
+          if (!window.Html5Qrcode) {
+            setStatus('O leitor não foi carregado. Verifique sua conexão e atualize a página.', 'error');
+            return;
+          }
+          startButton.disabled = true;
+          setStatus('Solicitando acesso à câmera…');
+          try {
+            scanner = new Html5Qrcode('reader', { verbose: false });
+            await scanner.start(
+              { facingMode: 'environment' },
+              { fps: 10, qrbox: { width: 300, height: 140 }, aspectRatio: 1.7778 },
+              onScan,
+              function () { /* Sem leitura durante o enquadramento é esperado. */ }
+            );
+            setStatus('Câmera ativa. Posicione o código dentro da área de leitura.');
+          } catch (error) {
+            startButton.disabled = false;
+            setStatus('Não foi possível abrir a câmera. Verifique a permissão do navegador.', 'error');
+          }
+        }
+
+        async function onScan(value) {
+          const code = String(value || '').replace(/\s/g, '');
+          const now = Date.now();
+          if (!code || (code === lastCode && now - lastReadAt < 1500)) return;
+          lastCode = code;
+          lastReadAt = now;
+          setStatus('Código lido. Enviando para a conferência…');
+          if (scanner) {
+            try { await scanner.stop(); } catch (error) { /* A leitura já foi concluída. */ }
+          }
+          decodedCode.textContent = code;
+          manual.hidden = false;
+          if (window.opener) {
+            window.opener.postMessage({ type: 'kit-barcode-scanned', code: code }, returnOrigin);
+            setStatus('Código enviado. Volte para a página do sistema.', 'success');
+          } else {
+            setStatus('Código lido, mas a página principal não está aberta.', 'error');
+          }
+        }
+
+        startButton.addEventListener('click', startScanning);
+      }());
+    </script>
+  </body>
+</html>
